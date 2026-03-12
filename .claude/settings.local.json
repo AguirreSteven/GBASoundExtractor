@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:loveemu.github.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:gist.github.com)",
+      "Bash(pip install:*)",
+      "Bash(python -c \":*)",
+      "WebFetch(domain:www.romhacking.net)",
+      "WebFetch(domain:tcrf.net)",
+      "WebFetch(domain:www.retroreversing.com)"
+    ]
+  }
+}
