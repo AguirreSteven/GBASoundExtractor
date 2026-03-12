@@ -71,39 +71,78 @@ class ADSREnvelope:
         return self.state == self.STATE_OFF
 
     def advance(self, num_frames: int) -> np.ndarray:
-        """Generate gain values for num_frames audio samples."""
+        """Generate gain values for num_frames audio samples (vectorised)."""
         out = np.empty(num_frames, dtype=np.float32)
-        i = 0
+        pos = 0
 
-        while i < num_frames:
+        while pos < num_frames:
+            remaining = num_frames - pos
+
             if self.state == self.STATE_ATTACK:
-                self.level += self._attack_rate
-                if self.level >= 1.0:
+                if self._attack_rate >= 1.0:
                     self.level = 1.0
                     self.state = self.STATE_DECAY
-                out[i] = self.level
+                    out[pos] = 1.0
+                    pos += 1
+                else:
+                    n_to_peak = max(1, int((1.0 - self.level) / self._attack_rate))
+                    n = min(remaining, n_to_peak)
+                    ramp = self.level + np.arange(1, n + 1) * self._attack_rate
+                    np.minimum(ramp, 1.0, out=ramp)
+                    out[pos:pos + n] = ramp
+                    self.level = float(ramp[-1])
+                    pos += n
+                    if self.level >= 1.0:
+                        self.level = 1.0
+                        self.state = self.STATE_DECAY
 
             elif self.state == self.STATE_DECAY:
-                self.level -= self._decay_rate
-                if self.level <= self._sustain_level:
+                if self._decay_rate >= 1.0:
                     self.level = self._sustain_level
                     self.state = self.STATE_SUSTAIN
-                out[i] = self.level
+                    out[pos] = self._sustain_level
+                    pos += 1
+                else:
+                    gap = self.level - self._sustain_level
+                    if gap <= 0:
+                        self.level = self._sustain_level
+                        self.state = self.STATE_SUSTAIN
+                        continue
+                    n_to_sus = max(1, int(gap / self._decay_rate))
+                    n = min(remaining, n_to_sus)
+                    ramp = self.level - np.arange(1, n + 1) * self._decay_rate
+                    np.maximum(ramp, self._sustain_level, out=ramp)
+                    out[pos:pos + n] = ramp
+                    self.level = float(ramp[-1])
+                    pos += n
+                    if self.level <= self._sustain_level:
+                        self.level = self._sustain_level
+                        self.state = self.STATE_SUSTAIN
 
             elif self.state == self.STATE_SUSTAIN:
-                out[i] = self._sustain_level
+                out[pos:] = self._sustain_level
+                pos = num_frames
 
             elif self.state == self.STATE_RELEASE:
-                self.level -= self._release_rate
-                if self.level <= 0.0:
+                if self._release_rate >= 1.0 or self.level <= 0:
                     self.level = 0.0
                     self.state = self.STATE_OFF
-                out[i] = self.level
+                    out[pos:] = 0.0
+                    pos = num_frames
+                else:
+                    n_to_zero = max(1, int(self.level / self._release_rate))
+                    n = min(remaining, n_to_zero)
+                    ramp = self.level - np.arange(1, n + 1) * self._release_rate
+                    np.maximum(ramp, 0.0, out=ramp)
+                    out[pos:pos + n] = ramp
+                    self.level = float(ramp[-1])
+                    pos += n
+                    if self.level <= 0.0:
+                        self.level = 0.0
+                        self.state = self.STATE_OFF
 
             else:  # STATE_OFF
-                out[i:] = 0.0
-                break
-
-            i += 1
+                out[pos:] = 0.0
+                pos = num_frames
 
         return out

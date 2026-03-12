@@ -5,7 +5,6 @@ interface (play/stop/pause/is_playing/is_active/elapsed/total_length/cleanup).
 """
 
 import logging
-import struct
 import threading
 import time
 import wave

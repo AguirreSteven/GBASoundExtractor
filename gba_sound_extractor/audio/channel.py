@@ -16,13 +16,10 @@ _NOTE_FREQ_TABLE = [
 ]
 
 
-def note_to_freq(note: int) -> float:
-    """Convert a MIDI note number (0-127) to frequency in Hz."""
-    if note < 0:
-        note = 0
-    elif note > 127:
-        note = 127
-    return _NOTE_FREQ_TABLE[note]
+def note_to_freq(note: float) -> float:
+    """Convert a MIDI note number (0-127, fractional OK) to frequency in Hz."""
+    note = max(0.0, min(127.0, float(note)))
+    return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
 
 class SynthChannel:
@@ -30,7 +27,7 @@ class SynthChannel:
 
     def __init__(self, sample_data, sample_rate, base_key, note, velocity,
                  adsr_params, output_rate, duration_frames=None,
-                 loop=False, loop_start=0, sample_length=0,
+                 loop=False, loop_start=0,
                  psg_generator=None):
         """
         Args:
@@ -38,7 +35,7 @@ class SynthChannel:
             sample_rate: native sample rate of the PCM data.
             base_key: root MIDI note of the sample (the note at which
                       the sample plays at its native rate).
-            note: the MIDI note to play.
+            note: the MIDI note to play (float OK for pitch bend).
             velocity: 0-127 velocity.
             adsr_params: (attack, decay, sustain, release) tuple.
             output_rate: audio output sample rate (e.g. 44100).
@@ -46,7 +43,6 @@ class SynthChannel:
                              None = sustained (TIE), waits for release().
             loop: whether the sample loops.
             loop_start: loop point in samples (from sample start).
-            sample_length: total sample length in samples.
             psg_generator: PSG generator instance (if not PCM).
         """
         self.output_rate = output_rate
@@ -140,42 +136,70 @@ class SynthChannel:
         return self._render_pcm(num_frames)
 
     def _render_pcm(self, num_frames: int) -> np.ndarray:
-        """Render PCM sample with linear interpolation and looping."""
+        """Render PCM sample with linear interpolation and looping (vectorised)."""
         if self.sample_data is None or self.sample_length == 0:
             self.finished = True
             return np.zeros(num_frames, dtype=np.float32)
 
-        out = np.zeros(num_frames, dtype=np.float32)
         data = self.sample_data
         length = self.sample_length
-        pos = self.position
-        speed = self.speed
+        total_requested = num_frames
 
-        for i in range(num_frames):
-            int_pos = int(pos)
+        # Compute all sample positions
+        positions = self.position + np.arange(num_frames) * self.speed
 
-            if int_pos >= length:
-                if self.loop and self.loop_length > 0:
-                    # Wrap around to loop point
-                    pos = self.loop_start + (pos - length) % self.loop_length
-                    int_pos = int(pos)
-                else:
-                    # Sample ended
+        if self.loop and self.loop_length > 0:
+            # Wrap positions past sample end into loop region
+            mask = positions >= length
+            if np.any(mask):
+                positions[mask] = (
+                    self.loop_start
+                    + (positions[mask] - length) % self.loop_length
+                )
+        else:
+            # Find where we exceed sample length
+            past_end = positions >= length
+            if np.any(past_end):
+                first_past = int(np.argmax(past_end))
+                if first_past == 0:
                     self.finished = True
-                    break
+                    return np.zeros(total_requested, dtype=np.float32)
+                self.finished = True
+                positions = positions[:first_past]
+                num_frames = first_past
 
-            # Linear interpolation
-            frac = pos - int_pos
-            s0 = data[int_pos]
-            if int_pos + 1 < length:
-                s1 = data[int_pos + 1]
-            elif self.loop and self.loop_length > 0:
-                s1 = data[self.loop_start]
-            else:
-                s1 = s0
+        # Integer indices and fractional parts for interpolation
+        int_pos = positions.astype(np.int64)
+        frac = (positions - int_pos).astype(np.float32)
 
-            out[i] = s0 + (s1 - s0) * frac
-            pos += speed
+        # Clamp indices to valid range
+        np.clip(int_pos, 0, length - 1, out=int_pos)
+        next_pos = int_pos + 1
 
-        self.position = pos
+        # Wrap next_pos for looping samples
+        if self.loop and self.loop_length > 0:
+            wrap_mask = next_pos >= length
+            next_pos[wrap_mask] = self.loop_start
+        else:
+            np.clip(next_pos, 0, length - 1, out=next_pos)
+
+        # Linear interpolation
+        s0 = data[int_pos]
+        s1 = data[next_pos]
+        out = s0 + (s1 - s0) * frac
+
+        # Update position
+        self.position = self.position + num_frames * self.speed
+
+        # Wrap position for next call
+        if self.loop and self.loop_length > 0 and self.position >= length:
+            self.position = (
+                self.loop_start
+                + (self.position - length) % self.loop_length
+            )
+
+        # Pad to requested size if we truncated due to sample end
+        if len(out) < total_requested:
+            out = np.pad(out, (0, total_requested - len(out)))
+
         return out

@@ -223,6 +223,7 @@ class GBASynth:
             key = max(0, min(127, key))
             voice = self._create_voice(ts, key, vel, duration_frames=None)
             if voice is not None:
+                voice._match_key = key  # integer key for EOT matching
                 self._add_voice(track_idx, voice)
                 ts.tied_voices.append(voice)
 
@@ -232,7 +233,8 @@ class GBASynth:
                 target_key = command.args[0] + ts.key_shift
                 target_key = max(0, min(127, target_key))
                 for v in ts.tied_voices:
-                    if v.note == target_key:
+                    match_key = getattr(v, '_match_key', None)
+                    if match_key == target_key:
                         v.release()
                 ts.tied_voices = [v for v in ts.tied_voices
                                   if not v._released]
@@ -284,7 +286,7 @@ class GBASynth:
 
         # Keysplit/percussion: resolve to sub-instrument by note
         if (is_keysplit or is_percussion) and inst.sub_instruments:
-            sub_idx = max(0, min(note, len(inst.sub_instruments) - 1))
+            sub_idx = int(max(0, min(note, len(inst.sub_instruments) - 1)))
             sub = inst.sub_instruments[sub_idx]
             if sub is not None:
                 return self._voice_from_instrument(
@@ -368,7 +370,6 @@ class GBASynth:
             duration_frames=duration_frames,
             loop=sample.loop,
             loop_start=sample.loop_start,
-            sample_length=sample.length,
         )
 
     def _add_voice(self, track_idx: int, voice: SynthChannel):
