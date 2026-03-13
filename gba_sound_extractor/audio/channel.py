@@ -47,6 +47,7 @@ class SynthChannel:
         """
         self.output_rate = output_rate
         self.note = note
+        # Linear velocity — track volume in the mixer applies the squared curve
         self.velocity_gain = velocity / 127.0
         self.finished = False
 

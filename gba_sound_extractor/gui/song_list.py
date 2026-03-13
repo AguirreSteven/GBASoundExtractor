@@ -22,12 +22,19 @@ _COLUMN_COUNT = 8
 _HEADERS = ["#", "Name", "Category", "Tracks", "Duration",
             "Tempo", "Loop", "Instruments"]
 
-# Category colour coding (background)
+# Category colour coding (dark theme)
 _CATEGORY_COLORS = {
-    "Music":   QColor(200, 220, 255),   # light blue
-    "SFX":     QColor(220, 220, 220),   # light grey
-    "Jingle":  QColor(255, 245, 200),   # light yellow
-    "Fanfare": QColor(210, 255, 210),   # light green
+    "Music":   QColor(26, 46, 74),      # dark blue
+    "SFX":     QColor(42, 42, 42),      # dark grey
+    "Jingle":  QColor(58, 53, 32),      # dark amber
+    "Fanfare": QColor(26, 58, 26),      # dark green
+}
+
+_CATEGORY_TEXT_COLORS = {
+    "Music":   QColor(91, 160, 240),    # #5ba0f0
+    "SFX":     QColor(153, 153, 153),   # #999999
+    "Jingle":  QColor(212, 184, 74),    # #d4b84a
+    "Fanfare": QColor(90, 192, 90),     # #5ac05a
 }
 
 
@@ -95,6 +102,11 @@ class SongTableModel(QAbstractTableModel):
 
         if role == Qt.BackgroundRole and col == COL_CATEGORY:
             color = _CATEGORY_COLORS.get(song.category)
+            if color:
+                return color
+
+        if role == Qt.ForegroundRole and col == COL_CATEGORY:
+            color = _CATEGORY_TEXT_COLORS.get(song.category)
             if color:
                 return color
 

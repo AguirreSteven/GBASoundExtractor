@@ -21,7 +21,6 @@ from ..audio.preview import MidiPlayer
 from ..audio.renderer import GBASynthPlayer, render_to_wav
 from ..audio.samples import SampleCache
 from ..analysis.tagger import tag_song
-from ..analysis.song_names import SongNameDatabase
 from ..analysis.custom_names import load_custom_names, save_custom_names
 from .song_list import SongListWidget
 from .player_bar import PlayerBar
@@ -138,16 +137,22 @@ class MainWindow(QMainWindow):
         self._game_code = ""
         self._custom_names = {}
 
-        self._name_db = SongNameDatabase()
         self._sample_cache = None
 
-        self._player = GBASynthPlayer()
+        self._synth_player = GBASynthPlayer()
+        self._midi_player = MidiPlayer()
+        self._use_pcm = True
         self._timer = QTimer()
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._update_playback)
 
         self._setup_menu()
         self._setup_ui()
+
+    @property
+    def _player(self):
+        """Return the currently active audio player."""
+        return self._synth_player if self._use_pcm else self._midi_player
 
     # ------------------------------------------------------------------
     # Menu bar
@@ -192,20 +197,27 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(8, 8, 8, 0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
         # --- Top bar: file path + open button ---
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(QLabel("ROM:"))
+        top_bar_widget = QWidget()
+        top_bar = QHBoxLayout(top_bar_widget)
+        top_bar.setContentsMargins(12, 8, 12, 8)
+        rom_label = QLabel("ROM:")
+        rom_label.setStyleSheet("color: #8a8a9a; font-weight: bold;")
+        top_bar.addWidget(rom_label)
         self._file_label = QLabel("Drag and drop a .gba file or click Open")
-        self._file_label.setStyleSheet("color: #666;")
+        self._file_label.setStyleSheet("color: #8a8a9a;")
         top_bar.addWidget(self._file_label, 1)
         open_btn = QPushButton("Open ROM...")
         open_btn.clicked.connect(self._open_file_dialog)
         top_bar.addWidget(open_btn)
-        main_layout.addLayout(top_bar)
+        main_layout.addWidget(top_bar_widget)
 
         # --- Middle: splitter with song list + details ---
+        splitter_wrapper = QWidget()
+        splitter_layout = QHBoxLayout(splitter_wrapper)
+        splitter_layout.setContentsMargins(8, 0, 8, 4)
         splitter = QSplitter(Qt.Horizontal)
 
         self._song_list = SongListWidget()
@@ -219,7 +231,8 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._details)
 
         splitter.setSizes([550, 300])
-        main_layout.addWidget(splitter, 1)
+        splitter_layout.addWidget(splitter)
+        main_layout.addWidget(splitter_wrapper, 1)
 
         # --- Bottom: player bar ---
         self._player_bar = PlayerBar()
@@ -229,6 +242,7 @@ class MainWindow(QMainWindow):
         self._player_bar.export_wav_clicked.connect(self._on_export_wav)
         self._player_bar.export_all_clicked.connect(self._on_export_all)
         self._player_bar.loop_count_changed.connect(self._on_loop_changed)
+        self._player_bar.engine_changed.connect(self._on_engine_changed)
         main_layout.addWidget(self._player_bar)
 
         # --- Status bar ---
@@ -284,7 +298,7 @@ class MainWindow(QMainWindow):
         self._sample_cache = None
 
         self._file_label.setText(os.path.basename(filepath))
-        self._file_label.setStyleSheet("")
+        self._file_label.setStyleSheet("color: #e0e0e0;")
         self._status.showMessage("Loading ROM...")
 
         self._worker = ROMLoadWorker(filepath)
@@ -311,9 +325,6 @@ class MainWindow(QMainWindow):
         self._file_label.setText(
             f"{os.path.basename(rom.filepath)} — {title} [{code}]")
 
-        # Apply known names from built-in database
-        self._apply_database_names()
-
         # Show songs immediately (tags will fill in after analysis)
         self._song_list.set_songs(songs)
         self._player_bar.set_enabled(True)
@@ -326,22 +337,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Song name resolution
     # ------------------------------------------------------------------
-
-    def _apply_database_names(self):
-        """Apply names from the built-in database for the current game."""
-        if not self._game_code:
-            return
-        if not self._name_db.has_game(self._game_code):
-            return
-        applied = 0
-        for song in self._songs:
-            db_name = self._name_db.get_name(self._game_code, song.index)
-            if db_name:
-                song.name = db_name
-                applied += 1
-        if applied:
-            logger.info("Applied %d names from built-in database for %s",
-                        applied, self._game_code)
 
     def _apply_custom_names(self, names):
         """Override song names with a user-provided mapping."""
@@ -519,16 +514,21 @@ class MainWindow(QMainWindow):
         if not song.decoded:
             return
 
-        # Parse instruments if not already done
-        if not song.instruments and self._rom is not None:
-            try:
-                song.instruments = parse_voice_group(
-                    self._rom, song.voice_group_offset)
-            except Exception as e:
-                logger.warning("Failed to parse voice group: %s", e)
-
         try:
-            self._player.play(song, self._sample_cache, rom=self._rom)
+            if self._use_pcm:
+                # PCM engine — render from ROM samples
+                if not song.instruments and self._rom is not None:
+                    try:
+                        song.instruments = parse_voice_group(
+                            self._rom, song.voice_group_offset)
+                    except Exception as e:
+                        logger.warning("Failed to parse voice group: %s", e)
+                self._synth_player.play(song, self._sample_cache, rom=self._rom)
+            else:
+                # MIDI engine — convert and play through system synth
+                midi = convert_song_to_midi(song)
+                self._midi_player.play(midi)
+
             self._player_bar.set_playing(True)
             self._timer.start()
             self._status.showMessage(f"Playing: {song.name}")
@@ -537,7 +537,8 @@ class MainWindow(QMainWindow):
             self._status.showMessage(f"Playback error: {e}")
 
     def _on_stop(self):
-        self._player.stop()
+        self._synth_player.stop()
+        self._midi_player.stop()
         self._timer.stop()
         self._player_bar.reset_time()
         self._status.showMessage("Stopped")
@@ -557,6 +558,16 @@ class MainWindow(QMainWindow):
         for song in self._songs:
             song.decoded = False
             song.tracks = []
+
+    def _on_engine_changed(self, index):
+        """Switch between PCM (0) and MIDI (1) audio engines."""
+        self._on_stop()
+        self._use_pcm = (index == 0)
+        # Export WAV only available with PCM engine
+        self._player_bar.export_wav_btn.setEnabled(
+            self._use_pcm and bool(self._songs))
+        engine_name = "PCM (GBA Samples)" if self._use_pcm else "MIDI (Wavetable)"
+        self._status.showMessage(f"Audio engine: {engine_name}")
 
     # ------------------------------------------------------------------
     # Export
@@ -671,7 +682,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
-        self._player.cleanup()
+        self._synth_player.cleanup()
+        self._midi_player.cleanup()
         if self._analysis_worker and self._analysis_worker.isRunning():
             self._analysis_worker.terminate()
             self._analysis_worker.wait(1000)

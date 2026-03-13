@@ -32,8 +32,15 @@ class TrackState:
         self.pitch_bend = 0.0  # in semitones
         self.bend_range = 2
         self.key_shift = 0
+        self.tune = 0            # TUNE: fine pitch offset (-64..+63 → cents)
         self.finished = False
         self.tied_voices: list[SynthChannel] = []
+        # LFO / modulation state
+        self.mod_depth = 0       # MOD: 0-127
+        self.mod_type = 0        # MODT: 0=pitch, 1=volume, 2=pan
+        self.lfo_speed = 22      # LFOS: default ~6 Hz
+        self.lfo_delay = 0       # LFODL: delay in ticks before LFO starts
+        self.lfo_phase = 0.0     # current LFO phase in radians
 
 
 class GBASynth:
@@ -72,6 +79,18 @@ class GBASynth:
 
         # Active voices
         self._voices: list[tuple[int, SynthChannel]] = []  # (track_idx, channel)
+
+        # Reverb buffer (MP2K uses a circular delay buffer)
+        reverb_val = song.reverb & 0x7F if song.reverb else 0
+        self._reverb_enabled = reverb_val > 0
+        # MP2K reverb delay is ~(buffer_size / sample_rate) seconds.
+        # The GBA uses a fixed buffer of ~(rate / fps) samples per frame.
+        # A reasonable approximation: ~33ms delay at 44100 Hz.
+        self._reverb_delay = int(output_rate * 0.033)
+        self._reverb_buf = np.zeros((self._reverb_delay, 2), dtype=np.float32)
+        self._reverb_pos = 0
+        # Reverb feedback strength: scale the 0-127 value
+        self._reverb_mix = (reverb_val / 127.0) * 0.5 if reverb_val > 0 else 0.0
 
         # Pre-compute total length by walking tempo changes
         self.total_frames = self._estimate_total_frames()
@@ -139,23 +158,23 @@ class GBASynth:
             else:
                 frames_to_render = frames_to_next
 
-            if frames_to_render <= 0:
-                frames_to_render = 0
-
             # Render active voices for this chunk
             if frames_to_render > 0:
                 self._mix_voices(output, frames_rendered, frames_to_render)
                 frames_rendered += frames_to_render
                 self._sample_pos += frames_to_render
 
-            # Process events at current position
+            # Process all events whose sample position we've reached or passed
             if self._timeline_pos < len(self._timeline):
                 event_tick = self._timeline[self._timeline_pos][0]
                 event_sample = self._tick_to_sample(event_tick)
                 if self._sample_pos >= event_sample:
                     self._process_events_at_tick(event_tick)
-                else:
-                    continue
+                elif frames_to_render == 0:
+                    # Event is in the future but we rendered nothing —
+                    # force advance by 1 frame to prevent stalling.
+                    frames_rendered += 1
+                    self._sample_pos += 1
             else:
                 # No more events — render remaining voices
                 if not self._voices:
@@ -216,6 +235,22 @@ class GBASynth:
         elif ct == cmd.KEYSH:
             ts.key_shift = command.args[0]
 
+        elif ct == cmd.MOD:
+            ts.mod_depth = min(command.args[0], 127)
+
+        elif ct == cmd.MODT:
+            ts.mod_type = command.args[0]
+
+        elif ct == cmd.LFOS:
+            ts.lfo_speed = command.args[0]
+
+        elif ct == cmd.LFODL:
+            ts.lfo_delay = command.args[0]
+
+        elif ct == cmd.TUNE:
+            # Fine tuning: 64 = center (no detune), range ±63 → ±1 semitone
+            ts.tune = command.args[0] - 64
+
         elif ct == cmd.TIE:
             # Sustained note
             key = command.args[0] + ts.key_shift if command.args else 60
@@ -271,8 +306,9 @@ class GBASynth:
         if inst_idx >= len(instruments):
             return None
         inst = instruments[inst_idx]
-        # Apply pitch bend as fractional note offset
-        bent_note = note + ts.pitch_bend
+        # Apply pitch bend and fine tuning as fractional note offset
+        # tune is -64..+63 mapping to ±1 semitone
+        bent_note = note + ts.pitch_bend + (ts.tune / 64.0)
         return self._voice_from_instrument(inst, bent_note, velocity,
                                            duration_frames, ts)
 
@@ -392,14 +428,66 @@ class GBASynth:
 
             mono = voice.render(num_frames)
 
-            # Apply track volume
-            vol_gain = ts.volume / 127.0
+            # Apply track volume (squared curve matches MP2K hardware)
+            vol_norm = ts.volume / 127.0
+            vol_gain = vol_norm * vol_norm
 
-            # Stereo panning (equal-power)
-            pan_norm = ts.pan / 127.0
-            left_gain = math.cos(pan_norm * math.pi / 2.0) * vol_gain
-            right_gain = math.sin(pan_norm * math.pi / 2.0) * vol_gain
+            # Stereo panning (linear, matching MP2K engine)
+            pan_val = ts.pan / 127.0
+
+            # LFO modulation
+            if ts.mod_depth > 0:
+                # LFO frequency: speed value maps roughly to Hz
+                lfo_freq = ts.lfo_speed / 3.6  # ~6 Hz at default speed=22
+                t = np.arange(num_frames) / self.output_rate
+                lfo = np.sin(ts.lfo_phase + 2 * math.pi * lfo_freq * t)
+                # Advance phase for next chunk
+                ts.lfo_phase += 2 * math.pi * lfo_freq * num_frames / self.output_rate
+                ts.lfo_phase %= (2 * math.pi)
+
+                depth = ts.mod_depth / 127.0
+
+                if ts.mod_type == 0:
+                    # Pitch vibrato: modulate by up to ±1 semitone
+                    pitch_mod = lfo * depth
+                    # Apply pitch shift via playback speed modulation
+                    freq_ratio = np.float32(2.0) ** (pitch_mod / 12.0)
+                    mono = mono * freq_ratio  # approximate amplitude-domain pitch
+                elif ts.mod_type == 1:
+                    # Volume tremolo
+                    vol_mod = 1.0 + lfo * depth * 0.5
+                    mono = mono * vol_mod.astype(np.float32)
+                elif ts.mod_type == 2:
+                    # Pan modulation — shift pan left/right
+                    pan_offset = lfo * depth * 0.5
+                    pan_val = np.clip(pan_val + pan_offset, 0.0, 1.0)
+
+            right_gain = pan_val * vol_gain
+            left_gain = (1.0 - pan_val) * vol_gain
 
             end = start + num_frames
             output[start:end, 0] += mono * left_gain
             output[start:end, 1] += mono * right_gain
+
+        # Apply reverb to the mixed output for this chunk
+        if self._reverb_enabled:
+            self._apply_reverb(output, start, num_frames)
+
+    def _apply_reverb(self, output: np.ndarray, start: int, num_frames: int):
+        """Apply MP2K-style reverb using a circular delay buffer."""
+        buf = self._reverb_buf
+        delay = self._reverb_delay
+        mix = self._reverb_mix
+        pos = self._reverb_pos
+
+        for i in range(num_frames):
+            idx = start + i
+            # Read delayed sample from buffer
+            delayed = buf[pos]
+            # Mix delayed signal into output
+            output[idx] += delayed * mix
+            # Write current output (with reverb) back into delay buffer
+            buf[pos] = output[idx]
+            pos = (pos + 1) % delay
+
+        self._reverb_pos = pos

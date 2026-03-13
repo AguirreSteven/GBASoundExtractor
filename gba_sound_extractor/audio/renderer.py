@@ -28,6 +28,11 @@ OUTPUT_RATE = 44100
 CHUNK_SIZE = 1024
 BUFFER_CHUNKS = 8  # ring buffer depth
 
+# Master gain to match GBA hardware output levels.
+# The GBA's SOUNDCNT_H register sets DirectSound output to 100% (2x),
+# and the linear pan law at center gives 0.5 per channel — this compensates.
+MASTER_GAIN = 2.5
+
 
 class GBASynthPlayer:
     """Streams GBA-synthesised audio in real time via sounddevice."""
@@ -160,7 +165,7 @@ class GBASynthPlayer:
             if len(self._buffer) < BUFFER_CHUNKS:
                 if self._synth is not None and not self._synth.finished:
                     chunk = self._synth.render_chunk(CHUNK_SIZE)
-                    # Clip to prevent distortion
+                    chunk *= MASTER_GAIN
                     np.clip(chunk, -1.0, 1.0, out=chunk)
                     self._buffer.append(chunk)
                 elif not self._buffer:
@@ -191,6 +196,7 @@ def render_to_wav(song: Song, sample_cache: SampleCache, filepath: str,
         return
 
     audio = np.concatenate(chunks, axis=0)
+    audio *= MASTER_GAIN
     np.clip(audio, -1.0, 1.0, out=audio)
 
     # Convert float32 [-1, 1] to int16

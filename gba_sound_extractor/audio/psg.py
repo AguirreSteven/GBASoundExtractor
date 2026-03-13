@@ -11,8 +11,9 @@ import numpy as np
 from ..rom.reader import ROMReader
 
 
-# GBA PSG volume relative to DirectSound (PCM). PSG channels are quieter.
-PSG_VOLUME_SCALE = 0.25
+# GBA PSG volume relative to DirectSound (PCM).
+# Real GBA hardware runs PSG at roughly half DirectSound level.
+PSG_VOLUME_SCALE = 0.5
 
 
 class SquareWaveGenerator:

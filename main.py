@@ -17,6 +17,9 @@ def main():
     app.setApplicationName("GBA Sound Extractor")
     app.setStyle("Fusion")
 
+    from gba_sound_extractor.gui.theme import apply_dark_theme
+    apply_dark_theme(app)
+
     window = MainWindow()
     window.show()
 
